@@ -20,11 +20,12 @@
   var ReactNative = common.ReactNative;
 
   var TAG = "[LucidLogger]";
-  var MAX_CACHE_SIZE = 1000;
+  var MAX_CACHE_SIZE = 1200;
 
-  var shadowCache = new Map();
-  var deletedMessagesMap = new Map();
-  var editedMessagesMap = new Map();
+  // Master storage structures
+  var shadowMessages = new Map();
+  var fakedMessages = new Map();
+  var editHistory = new Map();
   var manualDeletes = new Set();
   var cleanups = [];
 
@@ -48,8 +49,8 @@
     return typeof m === "object" && m !== null && typeof m.updateRows === "function";
   }
 
-  var MessageStore = (findByProps && findByProps("getMessage", "getMessages")) || rawFind(function(m) { return typeof m?.getMessage === "function" && typeof m?.getMessages === "function"; });
-  var ChannelMessages = (findByProps && findByProps("_channelMessages")) || rawFind(function(m) { return m && m._channelMessages !== undefined; });
+  var ChannelMessages = (findByProps && findByProps("_channelMessages")) || rawFind(function(m) { return m && (m._channelMessages !== undefined || (typeof m.get === "function" && typeof m.commit === "function")); });
+  var MessageStore = (findByProps && findByProps("getMessage", "getMessages")) || (findByStoreName && findByStoreName("MessageStore"));
   var ChannelStore = (findByProps && findByProps("getChannel", "getDMFromUserId")) || (findByStoreName && findByStoreName("ChannelStore"));
   var UserStore = (findByStoreName && findByStoreName("UserStore")) || (findByProps && findByProps("getCurrentUser"));
   var AuthStore = (findByStoreName && findByStoreName("AuthenticationStore")) || (findByProps && findByProps("getToken"));
@@ -62,70 +63,18 @@
            (AuthStore && AuthStore.getCurrentUser && AuthStore.getCurrentUser().id);
   }
 
-  function trimMap(map) {
-    if (map.size > MAX_CACHE_SIZE) {
-      var oldest = map.keys().next().value;
-      if (oldest !== undefined) map.delete(oldest);
+  function evictOldest(map, max) {
+    while (map.size > max) {
+      var key = map.keys().next().value;
+      if (key === undefined) break;
+      map.delete(key);
     }
   }
 
-  function authorToGateway(a) {
-    if (!a || typeof a !== "object") return a;
-    return {
-      id: String(a.id || "0"),
-      username: String(a.username || "Unknown"),
-      discriminator: a.discriminator && a.discriminator !== "???" ? String(a.discriminator) : "0",
-      avatar: a.avatar || null,
-      avatar_decoration_data: a.avatarDecorationData || a.avatar_decoration_data || null,
-      bot: Boolean(a.bot),
-      global_name: a.globalName || a.global_name || a.username || "Unknown"
-    };
-  }
-
-  function embedToGateway(e) {
-    if (!e || typeof e !== "object") return e;
-    return Object.assign({}, e, {
-      title: e.rawTitle || e.title,
-      description: e.rawDescription || e.description,
-      fields: Array.isArray(e.fields) ? e.fields.map(function (f) {
-        return {
-          name: f.rawName || f.name || "",
-          value: f.rawValue || f.value || "",
-          inline: Boolean(f.inline)
-        };
-      }) : undefined,
-      author: e.author ? {
-        name: e.author.name,
-        url: e.author.url,
-        icon_url: e.author.iconURL || e.author.icon_url,
-        proxy_icon_url: e.author.iconProxyURL || e.author.proxy_icon_url
-      } : undefined,
-      image: e.image ? {
-        url: e.image.url,
-        proxy_url: e.image.proxyURL || e.image.proxy_url,
-        width: e.image.width,
-        height: e.image.height
-      } : undefined,
-      thumbnail: e.thumbnail ? {
-        url: e.thumbnail.url,
-        proxy_url: e.thumbnail.proxyURL || e.thumbnail.proxy_url,
-        width: e.thumbnail.width,
-        height: e.thumbnail.height
-      } : undefined
-    });
-  }
-
-  function recordToGateway(record) {
-    if (!record || typeof record !== "object") return record;
-    return Object.assign({}, record, {
-      id: String(record.id || ""),
-      channel_id: String(record.channel_id || record.channelId || ""),
-      guild_id: record.guild_id || record.guildId || null,
-      content: String(record.content || ""),
-      author: authorToGateway(record.author),
-      embeds: Array.isArray(record.embeds) ? record.embeds.map(embedToGateway) : record.embeds,
-      attachments: Array.isArray(record.attachments) ? record.attachments : []
-    });
+  function rememberMessage(msg) {
+    if (!msg || !msg.id) return;
+    shadowMessages.set(String(msg.id), msg);
+    evictOldest(shadowMessages, MAX_CACHE_SIZE);
   }
 
   function mergeAttachments(original, updated) {
@@ -146,29 +95,44 @@
     return Array.from(map.values());
   }
 
-  function handleRow(row, opts) {
+  function reinsertMessageIntoStore(channelId, originalMsg) {
+    if (!ChannelMessages || !channelId || !originalMsg) return false;
+    try {
+      var record = ChannelMessages.get(channelId);
+      if (record && typeof record.receiveMessage === "function") {
+        var next = record.receiveMessage(originalMsg);
+        ChannelMessages.commit(next);
+        return true;
+      }
+    } catch (err) {
+      console.warn(TAG, "Failed ChannelMessages.receiveMessage:", err);
+    }
+    return false;
+  }
+
+  function handleRow(row, opts, RED_BG, RED_GUTTER, YELLOW_BG, YELLOW_GUTTER, RED_TEXT) {
     if (!row || row.type !== 1) return;
     var msg = row.message;
-    if (!msg) return;
+    if (!msg || !msg.id) return;
 
-    var isDeleted = deletedMessagesMap.has(msg.id) || Boolean(msg.was_deleted);
-    var isEdited = editedMessagesMap.has(msg.id);
+    var isDeleted = fakedMessages.has(msg.id) || Boolean(msg.was_deleted);
+    var isEdited = editHistory.has(msg.id);
 
     if (!isDeleted && !isEdited) return;
 
     if (isDeleted) {
       msg.edited = "(deleted)";
       if (opts.colorHighlights !== false) {
-        msg.textColor = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747";
+        msg.textColor = RED_TEXT;
         row.backgroundHighlight = {
-          backgroundColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#f047471f") : "#f047471f",
-          gutterColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747"
+          backgroundColor: RED_BG,
+          gutterColor: RED_GUTTER
         };
       }
     } else if (isEdited && opts.colorHighlights !== false) {
       row.backgroundHighlight = {
-        backgroundColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a18") : "#faa61a18",
-        gutterColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a") : "#faa61a"
+        backgroundColor: YELLOW_BG,
+        gutterColor: YELLOW_GUTTER
       };
     }
   }
@@ -193,7 +157,7 @@
         View,
         { style: { marginBottom: 16, padding: 14, backgroundColor: "#1e1f22", borderRadius: 8 } },
         React.createElement(Text, { style: { fontSize: 18, fontWeight: "bold", color: "#f04747", marginBottom: 4 } }, "Lucid Message Logger (Vencord Edition)"),
-        React.createElement(Text, { style: { fontSize: 13, color: "#949BA4" } }, "Guaranteed delete logging with Vencord PC red/yellow highlights & native delete.")
+        React.createElement(Text, { style: { fontSize: 13, color: "#949BA4" } }, "Direct store reinsertion + Vencord PC red/yellow highlights & native delete.")
       ),
       FormSection ? React.createElement(
         FormSection,
@@ -248,12 +212,12 @@
         { title: "Diagnostics & Storage" },
         React.createElement(FormRow, {
           label: "Clear Memory Cache",
-          subLabel: deletedMessagesMap.size + " deleted messages logged in RAM (" + shadowCache.size + " cached)",
+          subLabel: fakedMessages.size + " deleted kept inline (" + shadowMessages.size + " messages cached)",
           onPress: function () {
-            var count = deletedMessagesMap.size;
-            deletedMessagesMap.clear();
-            editedMessagesMap.clear();
-            shadowCache.clear();
+            var count = fakedMessages.size;
+            fakedMessages.clear();
+            editHistory.clear();
+            shadowMessages.clear();
             if (toasts && toasts.showToast) {
               toasts.showToast("Cleared " + count + " logged messages from Lucid cache!");
             }
@@ -274,7 +238,13 @@
       if (opts.ignoreBots === undefined) opts.ignoreBots = false;
       if (opts.ignoreSelf === undefined) opts.ignoreSelf = false;
 
-      // 1. PATCH NATIVE DELETE ACTION
+      var RED_BG = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f047471f") : "#f047471f";
+      var RED_GUTTER = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747";
+      var YELLOW_BG = ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a18") : "#faa61a18";
+      var YELLOW_GUTTER = ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a") : "#faa61a";
+      var RED_TEXT = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747";
+
+      // 1. NATIVE DELETE ACTION
       if (before && MessageActions && MessageActions.deleteMessage) {
         var unpatchDelete = before("deleteMessage", MessageActions, function (args) {
           try {
@@ -283,9 +253,9 @@
             if (!messageId) return;
 
             manualDeletes.add(messageId);
-            deletedMessagesMap.delete(messageId);
-            editedMessagesMap.delete(messageId);
-            shadowCache.delete(messageId);
+            fakedMessages.delete(messageId);
+            editHistory.delete(messageId);
+            shadowMessages.delete(messageId);
 
             if (ChannelMessages && ChannelMessages.get) {
               var record = ChannelMessages.get(channelId);
@@ -316,7 +286,7 @@
         cleanups.push(unpatchDelete);
       }
 
-      // 2. PATCH MESSAGE RECORD CREATION/UPDATE
+      // 2. PRESERVE WAS_DELETED IN MESSAGERECORDUTILS
       if (after && MessageRecordUtils) {
         if (MessageRecordUtils.createMessageRecord) {
           cleanups.push(
@@ -341,203 +311,183 @@
         }
       }
 
-      // 3. PATCH FLUX DISPATCHER
-      if (!before || !FluxDispatcher) {
-        console.warn(TAG, "FluxDispatcher or patcher not found!");
-        return;
-      }
+      // 3. FLUX EVENT LISTENERS (BOTH SUBSCRIBE & DISPATCH HOOKS FOR 100% COVERAGE)
+      if (FluxDispatcher) {
+        // 3A. Shadow cache populator
+        var handleCreate = function (ev) {
+          if (ev && ev.message) rememberMessage(ev.message);
+        };
+        var handleLoadSuccess = function (ev) {
+          if (ev && Array.isArray(ev.messages)) {
+            for (var i = 0; i < ev.messages.length; i++) rememberMessage(ev.messages[i]);
+          }
+        };
 
-      var unpatchFlux = before("dispatch", FluxDispatcher, function (args) {
-        try {
-          var ev = args[0];
-          if (!ev || !ev.type || ev.otherPluginBypass) return;
+        FluxDispatcher.subscribe("MESSAGE_CREATE", handleCreate);
+        cleanups.push(function () { FluxDispatcher.unsubscribe("MESSAGE_CREATE", handleCreate); });
 
-          var currentUserId = getCurrentUserId();
+        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handleLoadSuccess);
+        cleanups.push(function () { FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", handleLoadSuccess); });
 
-          // 3A. Real-time Shadow Caching (MESSAGE_CREATE & LOAD_MESSAGES_SUCCESS)
-          if (ev.type === "MESSAGE_CREATE" && ev.message && ev.message.id) {
-            shadowCache.set(ev.message.id, ev.message);
-            trimMap(shadowCache);
+        // 3B. Subscription listener for MESSAGE_DELETE (re-inserts message if deleted)
+        var handleDeleteSubscribe = function (ev) {
+          if (!ev || !opts.logDeleted) return;
+          var messageId = ev.id;
+          var channelId = ev.channelId || ev.channel_id;
+          if (!messageId || !channelId) return;
+
+          if (manualDeletes.has(messageId) || ev.manualDelete) {
+            manualDeletes.delete(messageId);
+            fakedMessages.delete(messageId);
             return;
           }
-          if (ev.type === "LOAD_MESSAGES_SUCCESS" && Array.isArray(ev.messages)) {
-            for (var mIdx = 0; mIdx < ev.messages.length; mIdx++) {
-              var loadedMsg = ev.messages[mIdx];
-              if (loadedMsg && loadedMsg.id) shadowCache.set(loadedMsg.id, loadedMsg);
-            }
-            trimMap(shadowCache);
-            return;
-          }
 
-          /* 3B. MESSAGE_DELETE */
-          if (ev.type === "MESSAGE_DELETE" && opts.logDeleted) {
-            if (ev.manualDelete || manualDeletes.has(ev.id)) {
-              manualDeletes.delete(ev.id);
-              deletedMessagesMap.delete(ev.id);
-              shadowCache.delete(ev.id);
-              return;
-            }
+          var original = shadowMessages.get(messageId);
+          if (!original) return;
 
-            var channelId = ev.channelId || ev.channel_id;
-            var messageId = ev.id;
+          var author = original.author;
+          var isBot = Boolean(author && (author.bot || (author.isNonUserBot && author.isNonUserBot())));
+          if (isBot && (original.flags === 64 || (original.flags & 64) === 64)) return;
+          if (opts.ignoreBots && isBot) return;
+          if (opts.ignoreSelf && author && author.id === getCurrentUserId()) return;
 
-            var orig =
-              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(channelId) && ChannelMessages.get(channelId).get && ChannelMessages.get(channelId).get(messageId)) ||
-              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(channelId, messageId)) ||
-              (MessageStore && MessageStore.getMessages && MessageStore.getMessages(channelId) && MessageStore.getMessages(channelId).get && MessageStore.getMessages(channelId).get(messageId)) ||
-              shadowCache.get(messageId) ||
-              (deletedMessagesMap.get(messageId) && deletedMessagesMap.get(messageId).original);
+          // Re-insert into store
+          var success = reinsertMessageIntoStore(channelId, original);
+          fakedMessages.set(messageId, channelId);
+          evictOldest(fakedMessages, MAX_CACHE_SIZE);
+        };
 
-            if (!orig) return;
+        FluxDispatcher.subscribe("MESSAGE_DELETE", handleDeleteSubscribe);
+        cleanups.push(function () { FluxDispatcher.unsubscribe("MESSAGE_DELETE", handleDeleteSubscribe); });
 
-            var author = orig.author;
-            var isBot = Boolean(author && (author.bot || (author.isNonUserBot && author.isNonUserBot())));
+        // 3C. Dispatch hook for real-time interception & Edits
+        if (before) {
+          var unpatchFlux = before("dispatch", FluxDispatcher, function (args) {
+            try {
+              var ev = args[0];
+              if (!ev || !ev.type || ev.otherPluginBypass) return;
 
-            // Ephemeral message dismiss check (flags: 64) from bots
-            if (isBot && (orig.flags === 64 || (orig.flags & 64) === 64)) return;
+              var currentUserId = getCurrentUserId();
 
-            // Empty message check
-            if (!orig.content && (!orig.attachments || !orig.attachments.length) && (!orig.embeds || !orig.embeds.length)) return;
-
-            if (opts.ignoreBots && isBot) return;
-            if (opts.ignoreSelf && author && author.id === currentUserId) return;
-
-            if (deletedMessagesMap.has(messageId)) {
-              ev.type = "MESSAGE_UPDATE";
-              ev.channelId = orig.channel_id || orig.channelId || channelId;
-              ev.message = {
-                id: messageId,
-                channel_id: orig.channel_id || orig.channelId || channelId,
-                flags: 64,
-                was_deleted: true
-              };
-              return args;
-            }
-
-            var resolvedGuildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(channelId) && ChannelStore.getChannel(channelId).guild_id) || orig.guild_id || orig.guildId;
-            var gatewayOrig = recordToGateway(orig);
-
-            ev.message = Object.assign({}, gatewayOrig, {
-              content: orig.content || "",
-              channel_id: orig.channel_id || orig.channelId || channelId,
-              guild_id: resolvedGuildId,
-              flags: 64,
-              was_deleted: true,
-              message_reference: orig.message_reference || orig.messageReference || null
-            });
-
-            ev.type = "MESSAGE_UPDATE";
-            ev.channelId = orig.channel_id || orig.channelId || channelId;
-            ev.optimistic = false;
-            ev.sendMessageOptions = {};
-            ev.isPushNotification = false;
-
-            deletedMessagesMap.set(messageId, { message: args, original: orig });
-            trimMap(deletedMessagesMap);
-
-            return args;
-          }
-
-          /* 3C. MESSAGE_DELETE_BULK */
-          if (ev.type === "MESSAGE_DELETE_BULK" && opts.logDeleted) {
-            if (!Array.isArray(ev.ids)) return;
-            var bulkChId = ev.channelId || ev.channel_id;
-
-            for (var k = 0; k < ev.ids.length; k++) {
-              var id = ev.ids[k];
-              if (manualDeletes.has(id)) {
-                manualDeletes.delete(id);
-                continue;
+              if (ev.type === "MESSAGE_CREATE" && ev.message) {
+                rememberMessage(ev.message);
+                return;
               }
 
-              var origBulk =
-                (ChannelMessages && ChannelMessages.get && ChannelMessages.get(bulkChId) && ChannelMessages.get(bulkChId).get && ChannelMessages.get(bulkChId).get(id)) ||
-                (MessageStore && MessageStore.getMessage && MessageStore.getMessage(bulkChId, id)) ||
-                shadowCache.get(id);
+              if (ev.type === "LOAD_MESSAGES_SUCCESS" && Array.isArray(ev.messages)) {
+                for (var m = 0; m < ev.messages.length; m++) rememberMessage(ev.messages[m]);
+                return;
+              }
 
-              if (!origBulk) continue;
-              if (opts.ignoreBots && origBulk.author && origBulk.author.bot) continue;
-              if (opts.ignoreSelf && origBulk.author && origBulk.author.id === currentUserId) continue;
+              /* MESSAGE_DELETE: Prevent deletion & keep inline */
+              if (ev.type === "MESSAGE_DELETE" && opts.logDeleted) {
+                var delMessageId = ev.id;
+                var delChannelId = ev.channelId || ev.channel_id;
+                if (!delMessageId || !delChannelId) return;
 
-              deletedMessagesMap.set(id, { original: origBulk });
-              trimMap(deletedMessagesMap);
+                if (manualDeletes.has(delMessageId) || ev.manualDelete) {
+                  manualDeletes.delete(delMessageId);
+                  fakedMessages.delete(delMessageId);
+                  return;
+                }
 
-              var gatewayBulk = recordToGateway(origBulk);
-              FluxDispatcher.dispatch({
-                type: "MESSAGE_UPDATE",
-                channelId: bulkChId,
-                message: Object.assign({}, gatewayBulk, {
-                  flags: 64,
+                var orig =
+                  shadowMessages.get(delMessageId) ||
+                  (ChannelMessages && ChannelMessages.get && ChannelMessages.get(delChannelId) && ChannelMessages.get(delChannelId).get && ChannelMessages.get(delChannelId).get(delMessageId)) ||
+                  (MessageStore && MessageStore.getMessage && MessageStore.getMessage(delChannelId, delMessageId));
+
+                if (!orig) return;
+
+                var author = orig.author;
+                var isBot = Boolean(author && (author.bot || (author.isNonUserBot && author.isNonUserBot())));
+                if (isBot && (orig.flags === 64 || (orig.flags & 64) === 64)) return;
+                if (opts.ignoreBots && isBot) return;
+                if (opts.ignoreSelf && author && author.id === currentUserId) return;
+
+                // Cache for reinsertion
+                rememberMessage(orig);
+                fakedMessages.set(delMessageId, delChannelId);
+                evictOldest(fakedMessages, MAX_CACHE_SIZE);
+
+                // Try in-place store re-insert
+                reinsertMessageIntoStore(delChannelId, orig);
+
+                // Convert deletion into an update event
+                ev.type = "MESSAGE_UPDATE";
+                ev.channelId = orig.channel_id || orig.channelId || delChannelId;
+                ev.message = Object.assign({}, orig, {
+                  id: delMessageId,
+                  channel_id: orig.channel_id || orig.channelId || delChannelId,
                   was_deleted: true
-                }),
-                otherPluginBypass: true
-              });
+                });
+                ev.optimistic = false;
+                ev.sendMessageOptions = {};
+                ev.isPushNotification = false;
+
+                return args;
+              }
+
+              /* MESSAGE_UPDATE (Edits) */
+              if (ev.type === "MESSAGE_UPDATE" && opts.logEdited) {
+                var updateMsg = ev.message;
+                if (!updateMsg) return;
+
+                if (!updateMsg.edited_timestamp || updateMsg.edited_timestamp === "invalid_timestamp") return;
+
+                var editChId = updateMsg.channel_id || ev.channelId || ev.channel_id;
+                var editMsgId = updateMsg.id || ev.id;
+                if (!editChId || !editMsgId) return;
+
+                var origEdit =
+                  shadowMessages.get(editMsgId) ||
+                  (ChannelMessages && ChannelMessages.get && ChannelMessages.get(editChId) && ChannelMessages.get(editChId).get && ChannelMessages.get(editChId).get(editMsgId)) ||
+                  (MessageStore && MessageStore.getMessage && MessageStore.getMessage(editChId, editMsgId));
+
+                if (!origEdit || !origEdit.author || !origEdit.author.id) return;
+
+                if (opts.ignoreBots && (origEdit.author.bot || (origEdit.author.isNonUserBot && origEdit.author.isNonUserBot()))) return;
+                if (opts.ignoreSelf && origEdit.author.id === currentUserId) return;
+
+                var oldContent = origEdit.content || "";
+                var newContent = updateMsg.content || "";
+
+                var hadAttachments = origEdit.attachments && origEdit.attachments.length > 0;
+                var lostAttachments = hadAttachments && (!updateMsg.attachments || updateMsg.attachments.length < origEdit.attachments.length);
+
+                if (oldContent === newContent && !lostAttachments) return;
+                if (oldContent.indexOf("~~") !== -1 && oldContent.endsWith(newContent)) return;
+
+                editHistory.set(editMsgId, oldContent);
+                evictOldest(editHistory, MAX_CACHE_SIZE);
+
+                var preservedAttachments = opts.preserveMedia !== false ? mergeAttachments(origEdit, updateMsg) : (updateMsg.attachments || []);
+                var formattedContent = oldContent !== newContent
+                  ? ("~~" + oldContent + "~~ `(edited)`\n" + newContent)
+                  : oldContent;
+
+                ev.message = Object.assign({}, origEdit, updateMsg, {
+                  content: formattedContent,
+                  attachments: preservedAttachments,
+                  edited_timestamp: "invalid_timestamp"
+                });
+
+                rememberMessage(ev.message);
+                return args;
+              }
+            } catch (e) {
+              console.error(TAG, "Flux dispatch error:", e);
             }
-            return;
-          }
-
-          /* 3D. MESSAGE_UPDATE (Edits) */
-          if (ev.type === "MESSAGE_UPDATE" && opts.logEdited) {
-            var msg = ev.message;
-            if (!msg) return;
-
-            if (!msg.edited_timestamp || msg.edited_timestamp === "invalid_timestamp") return;
-
-            var editChId = msg.channel_id || ev.channelId || ev.channel_id;
-            var editMsgId = msg.id || ev.id;
-            if (!editChId || !editMsgId) return;
-
-            var origEdit =
-              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(editChId, editMsgId)) ||
-              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(editChId) && ChannelMessages.get(editChId).get && ChannelMessages.get(editChId).get(editMsgId)) ||
-              shadowCache.get(editMsgId);
-
-            if (!origEdit || !origEdit.author || !origEdit.author.id) return;
-
-            if (opts.ignoreBots && (origEdit.author.bot || (origEdit.author.isNonUserBot && origEdit.author.isNonUserBot()))) return;
-            if (opts.ignoreSelf && origEdit.author.id === currentUserId) return;
-
-            var oldContent = origEdit.content || "";
-            var newContent = msg.content || "";
-
-            var hadAttachments = origEdit.attachments && origEdit.attachments.length > 0;
-            var lostAttachments = hadAttachments && (!msg.attachments || msg.attachments.length < origEdit.attachments.length);
-
-            if (oldContent === newContent && !lostAttachments) return;
-            if (oldContent.indexOf("~~") !== -1 && oldContent.endsWith(newContent)) return;
-
-            editedMessagesMap.set(editMsgId, { original: origEdit });
-            trimMap(editedMessagesMap);
-
-            var gatewayOrigEdit = recordToGateway(origEdit);
-            var preservedAttachments = opts.preserveMedia !== false ? mergeAttachments(origEdit, msg) : (msg.attachments || []);
-
-            var formattedContent = oldContent !== newContent
-              ? ("~~" + oldContent + "~~ `(edited)`\n" + newContent)
-              : oldContent;
-
-            ev.message = Object.assign({}, gatewayOrigEdit, msg, {
-              content: formattedContent,
-              attachments: preservedAttachments,
-              guild_id: (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(editChId) && ChannelStore.getChannel(editChId).guild_id) || msg.guild_id,
-              edited_timestamp: "invalid_timestamp",
-              message_reference: msg.message_reference || origEdit.messageReference || origEdit.message_reference || null
-            });
-
-            return args;
-          }
-        } catch (e) {
-          console.error(TAG, "Flux dispatch error:", e);
+          });
+          cleanups.push(unpatchFlux);
         }
-      });
-      cleanups.push(unpatchFlux);
+      }
 
-      // 4. PATCH ROW STYLING
+      // 4. ROW STYLING (Red for Deleted, Yellow for Edited)
       var DCDChatManager = ReactNative && ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager;
       var applyHook = function (target) {
         cleanups.push(
           before("updateRows", target, function (args) {
-            if (!deletedMessagesMap.size && !editedMessagesMap.size) return;
+            if (!fakedMessages.size && !editHistory.size) return;
             var raw = args && args[1];
             if (!raw) return;
 
@@ -548,8 +498,8 @@
                 for (var i = 0; i < rows.length; i++) {
                   var row = rows[i];
                   if (row && row.type === 1 && row.message) {
-                    if (deletedMessagesMap.has(row.message.id) || row.message.was_deleted || editedMessagesMap.has(row.message.id)) {
-                      handleRow(row, opts);
+                    if (fakedMessages.has(row.message.id) || row.message.was_deleted || editHistory.has(row.message.id)) {
+                      handleRow(row, opts, RED_BG, RED_GUTTER, YELLOW_BG, YELLOW_GUTTER, RED_TEXT);
                       mutated = true;
                     }
                   }
@@ -561,11 +511,11 @@
               } catch (err) {}
             } else if (Array.isArray(raw)) {
               for (var j = 0; j < raw.length; j++) {
-                handleRow(raw[j], opts);
+                handleRow(raw[j], opts, RED_BG, RED_GUTTER, YELLOW_BG, YELLOW_GUTTER, RED_TEXT);
               }
             } else if (raw && typeof raw === "object" && Array.isArray(raw.rows)) {
               for (var r = 0; r < raw.rows.length; r++) {
-                handleRow(raw.rows[r], opts);
+                handleRow(raw.rows[r], opts, RED_BG, RED_GUTTER, YELLOW_BG, YELLOW_GUTTER, RED_TEXT);
               }
             }
           })
@@ -585,9 +535,9 @@
       if (after && RowManager && RowManager.prototype && RowManager.prototype.generate) {
         cleanups.push(
           after("generate", RowManager.prototype, function (_args, rowObj) {
-            if (!deletedMessagesMap.size && !editedMessagesMap.size) return;
+            if (!fakedMessages.size && !editHistory.size) return;
             var row = (rowObj && rowObj.row) || rowObj;
-            handleRow(row, opts);
+            handleRow(row, opts, RED_BG, RED_GUTTER, YELLOW_BG, YELLOW_GUTTER, RED_TEXT);
           })
         );
       }
@@ -598,9 +548,9 @@
         try { cleanups[i](); } catch (e) {}
       }
       cleanups.length = 0;
-      deletedMessagesMap.clear();
-      editedMessagesMap.clear();
-      shadowCache.clear();
+      shadowMessages.clear();
+      fakedMessages.clear();
+      editHistory.clear();
       manualDeletes.clear();
     },
 
