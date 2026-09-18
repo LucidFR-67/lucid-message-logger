@@ -1,6 +1,6 @@
 {
   "name": "Lucid Message Logger",
-  "description": "⚡ Desktop Vencord UI inline message logger with shadow-caching, red/yellow highlights & strikethrough diffs.",
+  "description": "⚡ Vencord PC style inline message logger with guaranteed delete logging, red/yellow highlights & native delete support.",
   "authors": [
     {
       "name": "Lucid",
@@ -8,8 +8,8 @@
     }
   ],
   "main": "index.js",
-  "version": "1.2.0",
-  "hash": "30b9e2cdcad9191113a4ffb3a45fbe91738b9fdd521ca82e4083c9c9c69ba417",
+  "version": "1.3.0",
+  "hash": "8d8172a1018c67ecfc043a0e948d7e050f4997012ecc0b6c07aa2ea368869ce7",
   "vendetta": {
     "icon": "ic_message_edit"
   }
