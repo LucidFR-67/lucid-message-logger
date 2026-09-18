@@ -8,8 +8,8 @@
     }
   ],
   "main": "index.js",
-  "version": "1.5.0",
-  "hash": "a7e572575b3b8b97271d043ea6fc79aef248e7e336c899b83bf94e2667b702bf",
+  "version": "1.6.0",
+  "hash": "ca63a8682f460ac597af6f1535ba2256abe647cc7e45bd11124f5e1206410af4",
   "vendetta": {
     "icon": "ic_message_edit"
   }
