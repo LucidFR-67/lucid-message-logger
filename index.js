@@ -20,20 +20,41 @@
   var ReactNative = common.ReactNative;
 
   var TAG = "[LucidLogger]";
-  var MAX_CACHE_SIZE = 800;
+  var MAX_CACHE_SIZE = 1000;
 
+  var shadowCache = new Map();
   var deletedMessagesMap = new Map();
   var editedMessagesMap = new Map();
   var manualDeletes = new Set();
   var cleanups = [];
 
-  var MessageStore = findByProps ? findByProps("getMessage", "getMessages") : null;
-  var ChannelMessages = findByProps ? findByProps("_channelMessages") : null;
-  var ChannelStore = findByProps ? findByProps("getChannel", "getDMFromUserId") : null;
-  var UserStore = findByStoreName ? findByStoreName("UserStore") : null;
+  function rawFind(predicate) {
+    if (typeof window === "undefined" || !window.modules) return undefined;
+    var mods = window.modules;
+    for (var id in mods) {
+      var def = mods[id];
+      if (!def || !def.isInitialized) continue;
+      var exports = def.publicModule && def.publicModule.exports;
+      if (!exports) continue;
+      try {
+        if (predicate(exports)) return exports;
+        if (exports.default != null && predicate(exports.default)) return exports.default;
+      } catch (e) {}
+    }
+    return undefined;
+  }
+
+  function isNativeUpdateRows(m) {
+    return typeof m === "object" && m !== null && typeof m.updateRows === "function";
+  }
+
+  var MessageStore = (findByProps && findByProps("getMessage", "getMessages")) || rawFind(function(m) { return typeof m?.getMessage === "function" && typeof m?.getMessages === "function"; });
+  var ChannelMessages = (findByProps && findByProps("_channelMessages")) || rawFind(function(m) { return m && m._channelMessages !== undefined; });
+  var ChannelStore = (findByProps && findByProps("getChannel", "getDMFromUserId")) || (findByStoreName && findByStoreName("ChannelStore"));
+  var UserStore = (findByStoreName && findByStoreName("UserStore")) || (findByProps && findByProps("getCurrentUser"));
   var AuthStore = (findByStoreName && findByStoreName("AuthenticationStore")) || (findByProps && findByProps("getToken"));
   var MessageActions = (findByProps && findByProps("deleteMessage", "startEditMessage")) || (findByProps && findByProps("deleteMessage"));
-  var MessageRecordUtils = findByProps ? findByProps("updateMessageRecord", "createMessageRecord") : null;
+  var MessageRecordUtils = (findByProps && findByProps("updateMessageRecord", "createMessageRecord")) || rawFind(function(m) { return typeof m?.updateMessageRecord === "function"; });
 
   function getCurrentUserId() {
     return (UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser().id) ||
@@ -97,6 +118,10 @@
   function recordToGateway(record) {
     if (!record || typeof record !== "object") return record;
     return Object.assign({}, record, {
+      id: String(record.id || ""),
+      channel_id: String(record.channel_id || record.channelId || ""),
+      guild_id: record.guild_id || record.guildId || null,
+      content: String(record.content || ""),
       author: authorToGateway(record.author),
       embeds: Array.isArray(record.embeds) ? record.embeds.map(embedToGateway) : record.embeds,
       attachments: Array.isArray(record.attachments) ? record.attachments : []
@@ -168,7 +193,7 @@
         View,
         { style: { marginBottom: 16, padding: 14, backgroundColor: "#1e1f22", borderRadius: 8 } },
         React.createElement(Text, { style: { fontSize: 18, fontWeight: "bold", color: "#f04747", marginBottom: 4 } }, "Lucid Message Logger (Vencord Edition)"),
-        React.createElement(Text, { style: { fontSize: 13, color: "#949BA4" } }, "Desktop Vencord UI with red/yellow highlights, deleted retention, and native delete.")
+        React.createElement(Text, { style: { fontSize: 13, color: "#949BA4" } }, "Guaranteed delete logging with Vencord PC red/yellow highlights & native delete.")
       ),
       FormSection ? React.createElement(
         FormSection,
@@ -223,11 +248,12 @@
         { title: "Diagnostics & Storage" },
         React.createElement(FormRow, {
           label: "Clear Memory Cache",
-          subLabel: deletedMessagesMap.size + " deleted messages currently logged in RAM",
+          subLabel: deletedMessagesMap.size + " deleted messages logged in RAM (" + shadowCache.size + " cached)",
           onPress: function () {
             var count = deletedMessagesMap.size;
             deletedMessagesMap.clear();
             editedMessagesMap.clear();
+            shadowCache.clear();
             if (toasts && toasts.showToast) {
               toasts.showToast("Cleared " + count + " logged messages from Lucid cache!");
             }
@@ -259,6 +285,7 @@
             manualDeletes.add(messageId);
             deletedMessagesMap.delete(messageId);
             editedMessagesMap.delete(messageId);
+            shadowCache.delete(messageId);
 
             if (ChannelMessages && ChannelMessages.get) {
               var record = ChannelMessages.get(channelId);
@@ -289,7 +316,7 @@
         cleanups.push(unpatchDelete);
       }
 
-      // 2. PATCH MESSAGE RECORD CREATION/UPDATE (Preserves was_deleted flag in Discord Store)
+      // 2. PATCH MESSAGE RECORD CREATION/UPDATE
       if (after && MessageRecordUtils) {
         if (MessageRecordUtils.createMessageRecord) {
           cleanups.push(
@@ -327,67 +354,94 @@
 
           var currentUserId = getCurrentUserId();
 
-          /* 3A. MESSAGE_DELETE */
+          // 3A. Real-time Shadow Caching (MESSAGE_CREATE & LOAD_MESSAGES_SUCCESS)
+          if (ev.type === "MESSAGE_CREATE" && ev.message && ev.message.id) {
+            shadowCache.set(ev.message.id, ev.message);
+            trimMap(shadowCache);
+            return;
+          }
+          if (ev.type === "LOAD_MESSAGES_SUCCESS" && Array.isArray(ev.messages)) {
+            for (var mIdx = 0; mIdx < ev.messages.length; mIdx++) {
+              var loadedMsg = ev.messages[mIdx];
+              if (loadedMsg && loadedMsg.id) shadowCache.set(loadedMsg.id, loadedMsg);
+            }
+            trimMap(shadowCache);
+            return;
+          }
+
+          /* 3B. MESSAGE_DELETE */
           if (ev.type === "MESSAGE_DELETE" && opts.logDeleted) {
             if (ev.manualDelete || manualDeletes.has(ev.id)) {
               manualDeletes.delete(ev.id);
               deletedMessagesMap.delete(ev.id);
+              shadowCache.delete(ev.id);
               return;
             }
 
+            var channelId = ev.channelId || ev.channel_id;
+            var messageId = ev.id;
+
             var orig =
-              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(ev.channelId) && ChannelMessages.get(ev.channelId).get && ChannelMessages.get(ev.channelId).get(ev.id)) ||
-              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(ev.channelId, ev.id)) ||
-              (deletedMessagesMap.get(ev.id) && deletedMessagesMap.get(ev.id).original);
+              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(channelId) && ChannelMessages.get(channelId).get && ChannelMessages.get(channelId).get(messageId)) ||
+              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(channelId, messageId)) ||
+              (MessageStore && MessageStore.getMessages && MessageStore.getMessages(channelId) && MessageStore.getMessages(channelId).get && MessageStore.getMessages(channelId).get(messageId)) ||
+              shadowCache.get(messageId) ||
+              (deletedMessagesMap.get(messageId) && deletedMessagesMap.get(messageId).original);
 
-            if (!orig || !orig.author || !orig.author.id) return;
+            if (!orig) return;
 
-            // Ephemeral message dismiss check (flags: 64)
-            if (orig.author.bot && (orig.flags === 64 || (orig.flags & 64) === 64)) return;
+            var author = orig.author;
+            var isBot = Boolean(author && (author.bot || (author.isNonUserBot && author.isNonUserBot())));
+
+            // Ephemeral message dismiss check (flags: 64) from bots
+            if (isBot && (orig.flags === 64 || (orig.flags & 64) === 64)) return;
 
             // Empty message check
             if (!orig.content && (!orig.attachments || !orig.attachments.length) && (!orig.embeds || !orig.embeds.length)) return;
 
-            if (opts.ignoreBots && (orig.author.bot || (orig.author.isNonUserBot && orig.author.isNonUserBot()))) return;
-            if (opts.ignoreSelf && orig.author.id === currentUserId) return;
+            if (opts.ignoreBots && isBot) return;
+            if (opts.ignoreSelf && author && author.id === currentUserId) return;
 
-            if (deletedMessagesMap.has(ev.id)) {
+            if (deletedMessagesMap.has(messageId)) {
               ev.type = "MESSAGE_UPDATE";
-              ev.channelId = orig.channel_id || ev.channelId;
+              ev.channelId = orig.channel_id || orig.channelId || channelId;
               ev.message = {
-                id: ev.id,
-                channel_id: orig.channel_id || ev.channelId,
+                id: messageId,
+                channel_id: orig.channel_id || orig.channelId || channelId,
+                flags: 64,
                 was_deleted: true
               };
               return args;
             }
 
-            var guildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(orig.channel_id || ev.channelId) && ChannelStore.getChannel(orig.channel_id || ev.channelId).guild_id) || orig.guild_id;
+            var resolvedGuildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(channelId) && ChannelStore.getChannel(channelId).guild_id) || orig.guild_id || orig.guildId;
             var gatewayOrig = recordToGateway(orig);
 
             ev.message = Object.assign({}, gatewayOrig, {
-              content: orig.content,
-              channel_id: orig.channel_id || ev.channelId,
-              guild_id: guildId,
+              content: orig.content || "",
+              channel_id: orig.channel_id || orig.channelId || channelId,
+              guild_id: resolvedGuildId,
+              flags: 64,
               was_deleted: true,
               message_reference: orig.message_reference || orig.messageReference || null
             });
 
             ev.type = "MESSAGE_UPDATE";
-            ev.channelId = orig.channel_id || ev.channelId;
+            ev.channelId = orig.channel_id || orig.channelId || channelId;
             ev.optimistic = false;
             ev.sendMessageOptions = {};
             ev.isPushNotification = false;
 
-            deletedMessagesMap.set(ev.id, { message: args, original: orig });
+            deletedMessagesMap.set(messageId, { message: args, original: orig });
             trimMap(deletedMessagesMap);
 
             return args;
           }
 
-          /* 3B. MESSAGE_DELETE_BULK */
+          /* 3C. MESSAGE_DELETE_BULK */
           if (ev.type === "MESSAGE_DELETE_BULK" && opts.logDeleted) {
             if (!Array.isArray(ev.ids)) return;
+            var bulkChId = ev.channelId || ev.channel_id;
 
             for (var k = 0; k < ev.ids.length; k++) {
               var id = ev.ids[k];
@@ -397,12 +451,13 @@
               }
 
               var origBulk =
-                (ChannelMessages && ChannelMessages.get && ChannelMessages.get(ev.channelId) && ChannelMessages.get(ev.channelId).get && ChannelMessages.get(ev.channelId).get(id)) ||
-                (MessageStore && MessageStore.getMessage && MessageStore.getMessage(ev.channelId, id));
+                (ChannelMessages && ChannelMessages.get && ChannelMessages.get(bulkChId) && ChannelMessages.get(bulkChId).get && ChannelMessages.get(bulkChId).get(id)) ||
+                (MessageStore && MessageStore.getMessage && MessageStore.getMessage(bulkChId, id)) ||
+                shadowCache.get(id);
 
-              if (!origBulk || !origBulk.author || !origBulk.author.id) continue;
-              if (opts.ignoreBots && (origBulk.author.bot || (origBulk.author.isNonUserBot && origBulk.author.isNonUserBot()))) continue;
-              if (opts.ignoreSelf && origBulk.author.id === currentUserId) continue;
+              if (!origBulk) continue;
+              if (opts.ignoreBots && origBulk.author && origBulk.author.bot) continue;
+              if (opts.ignoreSelf && origBulk.author && origBulk.author.id === currentUserId) continue;
 
               deletedMessagesMap.set(id, { original: origBulk });
               trimMap(deletedMessagesMap);
@@ -410,8 +465,9 @@
               var gatewayBulk = recordToGateway(origBulk);
               FluxDispatcher.dispatch({
                 type: "MESSAGE_UPDATE",
-                channelId: ev.channelId,
+                channelId: bulkChId,
                 message: Object.assign({}, gatewayBulk, {
+                  flags: 64,
                   was_deleted: true
                 }),
                 otherPluginBypass: true
@@ -420,20 +476,21 @@
             return;
           }
 
-          /* 3C. MESSAGE_UPDATE */
+          /* 3D. MESSAGE_UPDATE (Edits) */
           if (ev.type === "MESSAGE_UPDATE" && opts.logEdited) {
             var msg = ev.message;
             if (!msg) return;
 
             if (!msg.edited_timestamp || msg.edited_timestamp === "invalid_timestamp") return;
 
-            var chId = msg.channel_id || ev.channelId;
-            var msgId = msg.id || ev.id;
-            if (!chId || !msgId) return;
+            var editChId = msg.channel_id || ev.channelId || ev.channel_id;
+            var editMsgId = msg.id || ev.id;
+            if (!editChId || !editMsgId) return;
 
             var origEdit =
-              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(chId, msgId)) ||
-              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(chId) && ChannelMessages.get(chId).get && ChannelMessages.get(chId).get(msgId));
+              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(editChId, editMsgId)) ||
+              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(editChId) && ChannelMessages.get(editChId).get && ChannelMessages.get(editChId).get(editMsgId)) ||
+              shadowCache.get(editMsgId);
 
             if (!origEdit || !origEdit.author || !origEdit.author.id) return;
 
@@ -449,7 +506,7 @@
             if (oldContent === newContent && !lostAttachments) return;
             if (oldContent.indexOf("~~") !== -1 && oldContent.endsWith(newContent)) return;
 
-            editedMessagesMap.set(msgId, { original: origEdit });
+            editedMessagesMap.set(editMsgId, { original: origEdit });
             trimMap(editedMessagesMap);
 
             var gatewayOrigEdit = recordToGateway(origEdit);
@@ -462,7 +519,7 @@
             ev.message = Object.assign({}, gatewayOrigEdit, msg, {
               content: formattedContent,
               attachments: preservedAttachments,
-              guild_id: (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(chId) && ChannelStore.getChannel(chId).guild_id) || msg.guild_id,
+              guild_id: (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(editChId) && ChannelStore.getChannel(editChId).guild_id) || msg.guild_id,
               edited_timestamp: "invalid_timestamp",
               message_reference: msg.message_reference || origEdit.messageReference || origEdit.message_reference || null
             });
@@ -475,7 +532,7 @@
       });
       cleanups.push(unpatchFlux);
 
-      // 4. PATCH ROW STYLING (Applies red/yellow background and (deleted) label to chat rows)
+      // 4. PATCH ROW STYLING
       var DCDChatManager = ReactNative && ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager;
       var applyHook = function (target) {
         cleanups.push(
@@ -519,9 +576,9 @@
         applyHook(DCDChatManager);
       }
 
-      var chatModule = (findByProps && findByProps("updateRows", "getConstants")) || (findByProps && findByProps("updateRows"));
-      if (chatModule && chatModule !== DCDChatManager) {
-        applyHook(chatModule);
+      var nativeChat = rawFind(isNativeUpdateRows) || (findByProps && findByProps("updateRows", "getConstants")) || (findByProps && findByProps("updateRows"));
+      if (nativeChat && nativeChat !== DCDChatManager) {
+        applyHook(nativeChat);
       }
 
       var RowManager = (findByName && findByName("RowManager", false)) || (findByProps && findByProps("RowManager") && findByProps("RowManager").RowManager);
@@ -543,6 +600,7 @@
       cleanups.length = 0;
       deletedMessagesMap.clear();
       editedMessagesMap.clear();
+      shadowCache.clear();
       manualDeletes.clear();
     },
 
