@@ -1,6 +1,6 @@
 {
   "name": "Lucid Message Logger",
-  "description": "⚡ Ultra-optimized, crash-proof inline deleted & edited message logger for Revenge, Bunny, and Vendetta.",
+  "description": "⚡ Ultra-optimized inline message logger with red/yellow backgrounds & native delete support.",
   "authors": [
     {
       "name": "Lucid",
@@ -8,8 +8,8 @@
     }
   ],
   "main": "index.js",
-  "version": "1.0.0",
-  "hash": "ee431db8ada41b16ec31d4acb2808f95c433a67c5ee6c5119ad4ff7dab1003a9",
+  "version": "1.1.0",
+  "hash": "7ffb026f1dbff4da81c6835b7dd3f220cf2bc130a01ef5e5d0f8cd47da89a624",
   "vendetta": {
     "icon": "ic_message_edit"
   }
