@@ -14,17 +14,16 @@
   var after = patcher.after;
   var findByProps = metro.findByProps;
   var findByStoreName = metro.findByStoreName;
+  var findByName = metro.findByName;
   var FluxDispatcher = common.FluxDispatcher;
   var React = common.React;
   var ReactNative = common.ReactNative;
 
   var TAG = "[LucidLogger]";
-  var MAX_CACHE_SIZE = 600;
+  var MAX_CACHE_SIZE = 800;
 
-  var shadowCache = new Map();
-  var deletedCache = new Map();
-  var deletedSet = new Set();
-  var editedSet = new Set();
+  var deletedMessagesMap = new Map();
+  var editedMessagesMap = new Map();
   var manualDeletes = new Set();
   var cleanups = [];
 
@@ -34,6 +33,7 @@
   var UserStore = findByStoreName ? findByStoreName("UserStore") : null;
   var AuthStore = (findByStoreName && findByStoreName("AuthenticationStore")) || (findByProps && findByProps("getToken"));
   var MessageActions = (findByProps && findByProps("deleteMessage", "startEditMessage")) || (findByProps && findByProps("deleteMessage"));
+  var MessageRecordUtils = findByProps ? findByProps("updateMessageRecord", "createMessageRecord") : null;
 
   function getCurrentUserId() {
     return (UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser().id) ||
@@ -41,26 +41,15 @@
            (AuthStore && AuthStore.getCurrentUser && AuthStore.getCurrentUser().id);
   }
 
-  function trimCache() {
-    if (shadowCache.size > MAX_CACHE_SIZE) {
-      var oldestKey = shadowCache.keys().next().value;
-      if (oldestKey !== undefined) shadowCache.delete(oldestKey);
-    }
-    if (deletedCache.size > MAX_CACHE_SIZE) {
-      var oldestDelKey = deletedCache.keys().next().value;
-      if (oldestDelKey !== undefined) {
-        deletedCache.delete(oldestDelKey);
-        deletedSet.delete(oldestDelKey);
-      }
-    }
-    if (editedSet.size > MAX_CACHE_SIZE) {
-      var oldestEditKey = editedSet.keys().next().value;
-      if (oldestEditKey !== undefined) editedSet.delete(oldestEditKey);
+  function trimMap(map) {
+    if (map.size > MAX_CACHE_SIZE) {
+      var oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
     }
   }
 
   function authorToGateway(a) {
-    if (!a) return { id: "0", username: "Unknown", discriminator: "0" };
+    if (!a || typeof a !== "object") return a;
     return {
       id: String(a.id || "0"),
       username: String(a.username || "Unknown"),
@@ -105,43 +94,13 @@
     });
   }
 
-  function messageToGateway(record) {
-    if (!record || typeof record !== "object") return null;
-    var author = record.author;
-    var attachments = record.attachments;
-    var embeds = record.embeds;
-    var mentions = record.mentions;
-    var mentionRoles = record.mentionRoles || record.mention_roles;
-
-    return {
-      id: String(record.id),
-      channel_id: String(record.channel_id || record.channelId),
-      guild_id: record.guild_id || record.guildId || null,
-      content: String(record.content || ""),
-      author: authorToGateway(author),
-      attachments: Array.isArray(attachments) ? attachments.map(function (a) {
-        return {
-          id: String(a.id || ""),
-          filename: a.filename || "attachment",
-          url: a.url || "",
-          proxy_url: a.proxyURL || a.proxy_url || a.url || "",
-          size: a.size || 0,
-          content_type: a.contentType || a.content_type || "image/png",
-          width: a.width,
-          height: a.height
-        };
-      }) : [],
-      embeds: Array.isArray(embeds) ? embeds.map(embedToGateway) : [],
-      mentions: Array.isArray(mentions) ? mentions : [],
-      mention_roles: Array.isArray(mentionRoles) ? mentionRoles : [],
-      pinned: Boolean(record.pinned),
-      timestamp: record.timestamp ? new Date(record.timestamp).toISOString() : new Date().toISOString(),
-      flags: typeof record.flags === "number" ? record.flags : 0,
-      components: Array.isArray(record.components) ? record.components : [],
-      sticker_items: record.sticker_items || record.stickerItems || record.stickers || [],
-      message_reference: record.message_reference || record.messageReference || null,
-      type: typeof record.type === "number" ? record.type : 0
-    };
+  function recordToGateway(record) {
+    if (!record || typeof record !== "object") return record;
+    return Object.assign({}, record, {
+      author: authorToGateway(record.author),
+      embeds: Array.isArray(record.embeds) ? record.embeds.map(embedToGateway) : record.embeds,
+      attachments: Array.isArray(record.attachments) ? record.attachments : []
+    });
   }
 
   function mergeAttachments(original, updated) {
@@ -160,6 +119,33 @@
       if (u && u.id) map.set(u.id, u);
     }
     return Array.from(map.values());
+  }
+
+  function handleRow(row, opts) {
+    if (!row || row.type !== 1) return;
+    var msg = row.message;
+    if (!msg) return;
+
+    var isDeleted = deletedMessagesMap.has(msg.id) || Boolean(msg.was_deleted);
+    var isEdited = editedMessagesMap.has(msg.id);
+
+    if (!isDeleted && !isEdited) return;
+
+    if (isDeleted) {
+      msg.edited = "(deleted)";
+      if (opts.colorHighlights !== false) {
+        msg.textColor = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747";
+        row.backgroundHighlight = {
+          backgroundColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#f047471f") : "#f047471f",
+          gutterColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747"
+        };
+      }
+    } else if (isEdited && opts.colorHighlights !== false) {
+      row.backgroundHighlight = {
+        backgroundColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a18") : "#faa61a18",
+        gutterColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a") : "#faa61a"
+      };
+    }
   }
 
   function Settings() {
@@ -182,23 +168,16 @@
         View,
         { style: { marginBottom: 16, padding: 14, backgroundColor: "#1e1f22", borderRadius: 8 } },
         React.createElement(Text, { style: { fontSize: 18, fontWeight: "bold", color: "#f04747", marginBottom: 4 } }, "Lucid Message Logger (Vencord Edition)"),
-        React.createElement(Text, { style: { fontSize: 13, color: "#949BA4" } }, "Desktop Vencord UI with red/yellow backgrounds, strikethrough edits, and native delete.")
+        React.createElement(Text, { style: { fontSize: 13, color: "#949BA4" } }, "Desktop Vencord UI with red/yellow highlights, deleted retention, and native delete.")
       ),
       FormSection ? React.createElement(
         FormSection,
-        { title: "Visual & Styling (Vencord PC Theme)" },
+        { title: "Appearance & Styling" },
         React.createElement(FormSwitchRow, {
           label: "Vencord Background Highlights",
           subLabel: "Soft red highlight on deleted messages, amber on edits",
           value: opts.colorHighlights !== false,
           onValueChange: function (v) { opts.colorHighlights = v; }
-        }),
-        React.createElement(FormDivider, null),
-        React.createElement(FormSwitchRow, {
-          label: "Strikethrough Edit Diff",
-          subLabel: "Show ~~old text~~ (edited) in Vencord desktop style",
-          value: opts.strikethroughEdits !== false,
-          onValueChange: function (v) { opts.strikethroughEdits = v; }
         }),
         React.createElement(FormDivider, null),
         React.createElement(FormSwitchRow, {
@@ -213,14 +192,14 @@
         { title: "Logging Options" },
         React.createElement(FormSwitchRow, {
           label: "Log Deleted Messages",
-          subLabel: "Keep deleted messages visible inline",
+          subLabel: "Keep deleted messages visible in chat",
           value: opts.logDeleted !== false,
           onValueChange: function (v) { opts.logDeleted = v; }
         }),
         React.createElement(FormDivider, null),
         React.createElement(FormSwitchRow, {
           label: "Log Edited Messages",
-          subLabel: "Keep full edit history visible",
+          subLabel: "Show old text and edit history",
           value: opts.logEdited !== false,
           onValueChange: function (v) { opts.logEdited = v; }
         }),
@@ -244,14 +223,13 @@
         { title: "Diagnostics & Storage" },
         React.createElement(FormRow, {
           label: "Clear Memory Cache",
-          subLabel: shadowCache.size + " in shadow cache, " + deletedCache.size + " deleted logged",
+          subLabel: deletedMessagesMap.size + " deleted messages currently logged in RAM",
           onPress: function () {
-            shadowCache.clear();
-            deletedCache.clear();
-            deletedSet.clear();
-            editedSet.clear();
+            var count = deletedMessagesMap.size;
+            deletedMessagesMap.clear();
+            editedMessagesMap.clear();
             if (toasts && toasts.showToast) {
-              toasts.showToast("Cleared Lucid cache successfully!");
+              toasts.showToast("Cleared " + count + " logged messages from Lucid cache!");
             }
           }
         })
@@ -267,16 +245,10 @@
       if (opts.logEdited === undefined) opts.logEdited = true;
       if (opts.preserveMedia === undefined) opts.preserveMedia = true;
       if (opts.colorHighlights === undefined) opts.colorHighlights = true;
-      if (opts.strikethroughEdits === undefined) opts.strikethroughEdits = true;
       if (opts.ignoreBots === undefined) opts.ignoreBots = false;
       if (opts.ignoreSelf === undefined) opts.ignoreSelf = false;
 
-      var RED_BG = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f047471f") : "#f047471f";
-      var RED_GUTTER = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747";
-      var YELLOW_BG = ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a18") : "#faa61a18";
-      var YELLOW_GUTTER = ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a") : "#faa61a";
-
-      // 1. HOOK NATIVE DELETE ACTION
+      // 1. PATCH NATIVE DELETE ACTION
       if (before && MessageActions && MessageActions.deleteMessage) {
         var unpatchDelete = before("deleteMessage", MessageActions, function (args) {
           try {
@@ -285,10 +257,8 @@
             if (!messageId) return;
 
             manualDeletes.add(messageId);
-            deletedCache.delete(messageId);
-            shadowCache.delete(messageId);
-            deletedSet.delete(messageId);
-            editedSet.delete(messageId);
+            deletedMessagesMap.delete(messageId);
+            editedMessagesMap.delete(messageId);
 
             if (ChannelMessages && ChannelMessages.get) {
               var record = ChannelMessages.get(channelId);
@@ -319,7 +289,32 @@
         cleanups.push(unpatchDelete);
       }
 
-      // 2. FLUX DISPATCHER LISTENER
+      // 2. PATCH MESSAGE RECORD CREATION/UPDATE (Preserves was_deleted flag in Discord Store)
+      if (after && MessageRecordUtils) {
+        if (MessageRecordUtils.createMessageRecord) {
+          cleanups.push(
+            after("createMessageRecord", MessageRecordUtils, function (args, record) {
+              var msg = args && args[0];
+              if ((msg && msg.was_deleted) || (record && record.was_deleted)) {
+                if (record) record.was_deleted = true;
+              }
+            })
+          );
+        }
+        if (MessageRecordUtils.updateMessageRecord) {
+          cleanups.push(
+            after("updateMessageRecord", MessageRecordUtils, function (args, record) {
+              var oldRec = args && args[0];
+              var newRec = args && args[1];
+              if ((oldRec && oldRec.was_deleted) || (newRec && newRec.was_deleted)) {
+                if (record) record.was_deleted = true;
+              }
+            })
+          );
+        }
+      }
+
+      // 3. PATCH FLUX DISPATCHER
       if (!before || !FluxDispatcher) {
         console.warn(TAG, "FluxDispatcher or patcher not found!");
         return;
@@ -327,127 +322,96 @@
 
       var unpatchFlux = before("dispatch", FluxDispatcher, function (args) {
         try {
-          var event = args[0];
-          if (!event || !event.type || event.otherPluginBypass) return;
+          var ev = args[0];
+          if (!ev || !ev.type || ev.otherPluginBypass) return;
 
           var currentUserId = getCurrentUserId();
 
-          // 2A. MESSAGE_CREATE: Cache all incoming messages immediately
-          if (event.type === "MESSAGE_CREATE") {
-            var msg = event.message;
-            if (msg && msg.id) {
-              var gateway = messageToGateway(msg);
-              if (gateway) {
-                shadowCache.set(msg.id, gateway);
-                trimCache();
-              }
-            }
-            return;
-          }
-
-          // 2B. MESSAGE_DELETE
-          if (event.type === "MESSAGE_DELETE" && opts.logDeleted) {
-            var channelId = event.channelId;
-            var messageId = event.id;
-            if (!channelId || !messageId) return;
-
-            if (manualDeletes.has(messageId) || event.manualDelete) {
-              manualDeletes.delete(messageId);
-              deletedCache.delete(messageId);
-              shadowCache.delete(messageId);
-              deletedSet.delete(messageId);
+          /* 3A. MESSAGE_DELETE */
+          if (ev.type === "MESSAGE_DELETE" && opts.logDeleted) {
+            if (ev.manualDelete || manualDeletes.has(ev.id)) {
+              manualDeletes.delete(ev.id);
+              deletedMessagesMap.delete(ev.id);
               return;
             }
 
-            var rawOrig =
-              shadowCache.get(messageId) ||
-              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(channelId) && ChannelMessages.get(channelId).get(messageId)) ||
-              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(channelId, messageId)) ||
-              (MessageStore && MessageStore.getMessages && MessageStore.getMessages(channelId) && MessageStore.getMessages(channelId).get && MessageStore.getMessages(channelId).get(messageId)) ||
-              deletedCache.get(messageId);
+            var orig =
+              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(ev.channelId) && ChannelMessages.get(ev.channelId).get && ChannelMessages.get(ev.channelId).get(ev.id)) ||
+              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(ev.channelId, ev.id)) ||
+              (deletedMessagesMap.get(ev.id) && deletedMessagesMap.get(ev.id).original);
 
-            var original = messageToGateway(rawOrig);
-            if (!original || !original.author || !original.author.id) return;
+            if (!orig || !orig.author || !orig.author.id) return;
 
-            if ((original.flags & 64) === 64) return;
-            if (opts.ignoreBots && (original.author.bot || (original.author.isNonUserBot && original.author.isNonUserBot()))) return;
-            if (opts.ignoreSelf && original.author.id === currentUserId) return;
+            // Ephemeral message dismiss check (flags: 64)
+            if (orig.author.bot && (orig.flags === 64 || (orig.flags & 64) === 64)) return;
 
-            var hasContent = original.content && original.content.trim().length > 0;
-            var hasMedia = (original.attachments && original.attachments.length > 0) || (original.embeds && original.embeds.length > 0);
-            if (!hasContent && !hasMedia) return;
+            // Empty message check
+            if (!orig.content && (!orig.attachments || !orig.attachments.length) && (!orig.embeds || !orig.embeds.length)) return;
 
-            if (deletedCache.has(messageId)) {
-              event.type = "MESSAGE_UPDATE";
-              event.message = {
-                id: messageId,
-                channel_id: channelId,
-                was_deleted: true,
-                flags: original.flags
+            if (opts.ignoreBots && (orig.author.bot || (orig.author.isNonUserBot && orig.author.isNonUserBot()))) return;
+            if (opts.ignoreSelf && orig.author.id === currentUserId) return;
+
+            if (deletedMessagesMap.has(ev.id)) {
+              ev.type = "MESSAGE_UPDATE";
+              ev.channelId = orig.channel_id || ev.channelId;
+              ev.message = {
+                id: ev.id,
+                channel_id: orig.channel_id || ev.channelId,
+                was_deleted: true
               };
               return args;
             }
 
-            deletedCache.set(messageId, original);
-            deletedSet.add(messageId);
-            trimCache();
+            var guildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(orig.channel_id || ev.channelId) && ChannelStore.getChannel(orig.channel_id || ev.channelId).guild_id) || orig.guild_id;
+            var gatewayOrig = recordToGateway(orig);
 
-            var guildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(channelId) && ChannelStore.getChannel(channelId).guild_id) || original.guild_id;
-
-            var deletedTag = "`(deleted)` ";
-            var finalContent = original.content && original.content.indexOf(deletedTag) === 0
-              ? original.content
-              : (deletedTag + (original.content || "")).trim();
-
-            event.type = "MESSAGE_UPDATE";
-            event.channelId = channelId;
-            event.optimistic = false;
-            event.isPushNotification = false;
-            event.message = Object.assign({}, original, {
-              content: finalContent,
+            ev.message = Object.assign({}, gatewayOrig, {
+              content: orig.content,
+              channel_id: orig.channel_id || ev.channelId,
               guild_id: guildId,
               was_deleted: true,
-              edited_timestamp: null
+              message_reference: orig.message_reference || orig.messageReference || null
             });
+
+            ev.type = "MESSAGE_UPDATE";
+            ev.channelId = orig.channel_id || ev.channelId;
+            ev.optimistic = false;
+            ev.sendMessageOptions = {};
+            ev.isPushNotification = false;
+
+            deletedMessagesMap.set(ev.id, { message: args, original: orig });
+            trimMap(deletedMessagesMap);
 
             return args;
           }
 
-          /* 2C. MESSAGE_DELETE_BULK */
-          if (event.type === "MESSAGE_DELETE_BULK" && opts.logDeleted) {
-            var ids = event.ids || [];
-            var bulkChannelId = event.channelId;
-            if (!ids.length || !bulkChannelId) return;
+          /* 3B. MESSAGE_DELETE_BULK */
+          if (ev.type === "MESSAGE_DELETE_BULK" && opts.logDeleted) {
+            if (!Array.isArray(ev.ids)) return;
 
-            for (var k = 0; k < ids.length; k++) {
-              var id = ids[k];
+            for (var k = 0; k < ev.ids.length; k++) {
+              var id = ev.ids[k];
               if (manualDeletes.has(id)) {
                 manualDeletes.delete(id);
                 continue;
               }
 
-              var rawBulk =
-                shadowCache.get(id) ||
-                (ChannelMessages && ChannelMessages.get && ChannelMessages.get(bulkChannelId) && ChannelMessages.get(bulkChannelId).get(id)) ||
-                (MessageStore && MessageStore.getMessage && MessageStore.getMessage(bulkChannelId, id));
+              var origBulk =
+                (ChannelMessages && ChannelMessages.get && ChannelMessages.get(ev.channelId) && ChannelMessages.get(ev.channelId).get && ChannelMessages.get(ev.channelId).get(id)) ||
+                (MessageStore && MessageStore.getMessage && MessageStore.getMessage(ev.channelId, id));
 
-              var origBulk = messageToGateway(rawBulk);
-              if (!origBulk || (origBulk.author && origBulk.author.bot)) continue;
+              if (!origBulk || !origBulk.author || !origBulk.author.id) continue;
+              if (opts.ignoreBots && (origBulk.author.bot || (origBulk.author.isNonUserBot && origBulk.author.isNonUserBot()))) continue;
+              if (opts.ignoreSelf && origBulk.author.id === currentUserId) continue;
 
-              deletedCache.set(id, origBulk);
-              deletedSet.add(id);
-              trimCache();
+              deletedMessagesMap.set(id, { original: origBulk });
+              trimMap(deletedMessagesMap);
 
-              var dTag = "`(deleted)` ";
-              var bContent = origBulk.content && origBulk.content.indexOf(dTag) === 0
-                ? origBulk.content
-                : (dTag + (origBulk.content || "")).trim();
-
+              var gatewayBulk = recordToGateway(origBulk);
               FluxDispatcher.dispatch({
                 type: "MESSAGE_UPDATE",
-                channelId: bulkChannelId,
-                message: Object.assign({}, origBulk, {
-                  content: bContent,
+                channelId: ev.channelId,
+                message: Object.assign({}, gatewayBulk, {
                   was_deleted: true
                 }),
                 otherPluginBypass: true
@@ -456,105 +420,119 @@
             return;
           }
 
-          /* 2D. MESSAGE_UPDATE (Edits) */
-          if (event.type === "MESSAGE_UPDATE" && opts.logEdited) {
-            var updateMsg = event.message;
-            if (!updateMsg || !updateMsg.edited_timestamp || updateMsg.edited_timestamp === "invalid_timestamp") return;
+          /* 3C. MESSAGE_UPDATE */
+          if (ev.type === "MESSAGE_UPDATE" && opts.logEdited) {
+            var msg = ev.message;
+            if (!msg) return;
 
-            var editChannelId = updateMsg.channel_id || event.channelId;
-            var editMessageId = updateMsg.id || event.id;
-            if (!editChannelId || !editMessageId) return;
+            if (!msg.edited_timestamp || msg.edited_timestamp === "invalid_timestamp") return;
 
-            var rawEdit =
-              shadowCache.get(editMessageId) ||
-              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(editChannelId) && ChannelMessages.get(editChannelId).get(editMessageId)) ||
-              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(editChannelId, editMessageId));
+            var chId = msg.channel_id || ev.channelId;
+            var msgId = msg.id || ev.id;
+            if (!chId || !msgId) return;
 
-            var origEdit = messageToGateway(rawEdit);
+            var origEdit =
+              (MessageStore && MessageStore.getMessage && MessageStore.getMessage(chId, msgId)) ||
+              (ChannelMessages && ChannelMessages.get && ChannelMessages.get(chId) && ChannelMessages.get(chId).get && ChannelMessages.get(chId).get(msgId));
+
             if (!origEdit || !origEdit.author || !origEdit.author.id) return;
 
-            if (opts.ignoreBots && origEdit.author.bot) return;
+            if (opts.ignoreBots && (origEdit.author.bot || (origEdit.author.isNonUserBot && origEdit.author.isNonUserBot()))) return;
             if (opts.ignoreSelf && origEdit.author.id === currentUserId) return;
 
-            var oldText = origEdit.content || "";
-            var newText = updateMsg.content || "";
+            var oldContent = origEdit.content || "";
+            var newContent = msg.content || "";
 
             var hadAttachments = origEdit.attachments && origEdit.attachments.length > 0;
-            var lostAttachments = hadAttachments && (!updateMsg.attachments || updateMsg.attachments.length < origEdit.attachments.length);
+            var lostAttachments = hadAttachments && (!msg.attachments || msg.attachments.length < origEdit.attachments.length);
 
-            if (oldText === newText && !lostAttachments) return;
-            if (oldText.indexOf("~~") !== -1 && oldText.endsWith(newText)) return;
+            if (oldContent === newContent && !lostAttachments) return;
+            if (oldContent.indexOf("~~") !== -1 && oldContent.endsWith(newContent)) return;
 
-            editedSet.add(editMessageId);
-            trimCache();
+            editedMessagesMap.set(msgId, { original: origEdit });
+            trimMap(editedMessagesMap);
 
-            var formattedContent = opts.strikethroughEdits && oldText !== newText
-              ? ("~~" + oldText + "~~ `(edited)`\n" + newText)
-              : (oldText !== newText ? (oldText + "\n`(edited)` " + newText) : oldText);
+            var gatewayOrigEdit = recordToGateway(origEdit);
+            var preservedAttachments = opts.preserveMedia !== false ? mergeAttachments(origEdit, msg) : (msg.attachments || []);
 
-            var preservedAttachments = opts.preserveMedia ? mergeAttachments(origEdit, updateMsg) : (updateMsg.attachments || []);
+            var formattedContent = oldContent !== newContent
+              ? ("~~" + oldContent + "~~ `(edited)`\n" + newContent)
+              : oldContent;
 
-            var updatedGateway = messageToGateway(Object.assign({}, origEdit, updateMsg, {
+            ev.message = Object.assign({}, gatewayOrigEdit, msg, {
               content: formattedContent,
-              attachments: preservedAttachments
-            }));
-
-            if (updatedGateway) shadowCache.set(editMessageId, updatedGateway);
-
-            event.message = Object.assign({}, updatedGateway, {
-              edited_timestamp: "invalid_timestamp"
+              attachments: preservedAttachments,
+              guild_id: (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(chId) && ChannelStore.getChannel(chId).guild_id) || msg.guild_id,
+              edited_timestamp: "invalid_timestamp",
+              message_reference: msg.message_reference || origEdit.messageReference || origEdit.message_reference || null
             });
 
             return args;
           }
-        } catch (err) {
-          console.error(TAG, "Dispatch error:", err);
+        } catch (e) {
+          console.error(TAG, "Flux dispatch error:", e);
         }
       });
       cleanups.push(unpatchFlux);
 
-      // 3. ROW STYLING (Vencord PC Red / Yellow Backgrounds)
-      var ChatManager = (ReactNative && ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager) || (findByProps && findByProps("updateRows"));
-      if (before && ChatManager && ChatManager.updateRows) {
-        var unpatchChat = before("updateRows", ChatManager, function (args) {
-          if (!opts.colorHighlights || (!deletedSet.size && !editedSet.size)) return;
-          try {
-            var rows = typeof args[1] === "string" ? JSON.parse(args[1]) : args[1];
-            var modified = false;
-            for (var r = 0; r < rows.length; r++) {
-              var row = rows[r];
-              var rId = row && row.message && row.message.id;
-              if (!rId) continue;
-              if (deletedSet.has(rId)) {
-                row.backgroundHighlight = { backgroundColor: RED_BG, gutterColor: RED_GUTTER };
-                modified = true;
-              } else if (editedSet.has(rId)) {
-                row.backgroundHighlight = { backgroundColor: YELLOW_BG, gutterColor: YELLOW_GUTTER };
-                modified = true;
+      // 4. PATCH ROW STYLING (Applies red/yellow background and (deleted) label to chat rows)
+      var DCDChatManager = ReactNative && ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager;
+      var applyHook = function (target) {
+        cleanups.push(
+          before("updateRows", target, function (args) {
+            if (!deletedMessagesMap.size && !editedMessagesMap.size) return;
+            var raw = args && args[1];
+            if (!raw) return;
+
+            if (typeof raw === "string") {
+              try {
+                var rows = JSON.parse(raw);
+                var mutated = false;
+                for (var i = 0; i < rows.length; i++) {
+                  var row = rows[i];
+                  if (row && row.type === 1 && row.message) {
+                    if (deletedMessagesMap.has(row.message.id) || row.message.was_deleted || editedMessagesMap.has(row.message.id)) {
+                      handleRow(row, opts);
+                      mutated = true;
+                    }
+                  }
+                }
+                if (mutated) {
+                  args[1] = JSON.stringify(rows);
+                  return args;
+                }
+              } catch (err) {}
+            } else if (Array.isArray(raw)) {
+              for (var j = 0; j < raw.length; j++) {
+                handleRow(raw[j], opts);
+              }
+            } else if (raw && typeof raw === "object" && Array.isArray(raw.rows)) {
+              for (var r = 0; r < raw.rows.length; r++) {
+                handleRow(raw.rows[r], opts);
               }
             }
-            if (modified) {
-              args[1] = typeof args[1] === "string" ? JSON.stringify(rows) : rows;
-            }
-          } catch (e) {}
-        });
-        cleanups.push(unpatchChat);
+          })
+        );
+      };
+
+      if (DCDChatManager && DCDChatManager.updateRows) {
+        applyHook(DCDChatManager);
       }
 
-      var RowManager = (findByProps && findByProps("RowManager") && findByProps("RowManager").RowManager) || (findByProps && findByProps("generate") && findByProps("generate").RowManager);
+      var chatModule = (findByProps && findByProps("updateRows", "getConstants")) || (findByProps && findByProps("updateRows"));
+      if (chatModule && chatModule !== DCDChatManager) {
+        applyHook(chatModule);
+      }
+
+      var RowManager = (findByName && findByName("RowManager", false)) || (findByProps && findByProps("RowManager") && findByProps("RowManager").RowManager);
       if (after && RowManager && RowManager.prototype && RowManager.prototype.generate) {
-        var unpatchRow = after("generate", RowManager.prototype, function (_args, row) {
-          try {
-            if (!opts.colorHighlights || !row || !row.message || !row.message.id) return;
-            var id = row.message.id;
-            if (deletedSet.has(id)) {
-              row.backgroundHighlight = { backgroundColor: RED_BG, gutterColor: RED_GUTTER };
-            } else if (editedSet.has(id)) {
-              row.backgroundHighlight = { backgroundColor: YELLOW_BG, gutterColor: YELLOW_GUTTER };
-            }
-          } catch (e) {}
-        });
-        cleanups.push(unpatchRow);
+        cleanups.push(
+          after("generate", RowManager.prototype, function (_args, rowObj) {
+            if (!deletedMessagesMap.size && !editedMessagesMap.size) return;
+            var row = (rowObj && rowObj.row) || rowObj;
+            handleRow(row, opts);
+          })
+        );
       }
     },
 
@@ -563,10 +541,8 @@
         try { cleanups[i](); } catch (e) {}
       }
       cleanups.length = 0;
-      shadowCache.clear();
-      deletedCache.clear();
-      deletedSet.clear();
-      editedSet.clear();
+      deletedMessagesMap.clear();
+      editedMessagesMap.clear();
       manualDeletes.clear();
     },
 
