@@ -1,7 +1,7 @@
 // Lucid Message Logger - Ultra-optimized, Vencord PC-styled message logger for Vendetta / Bunny / Revenge
 import { patcher, metro, common, ui, plugin } from "@vendetta";
 
-const { before, after, instead } = patcher;
+const { before, after } = patcher;
 const { findByProps, findByStoreName, findByName } = metro;
 const { FluxDispatcher, React, ReactNative } = common;
 const { storage } = plugin;
@@ -13,6 +13,7 @@ const MAX_CACHE_SIZE = 1500;
 const deletedMessageMap = new Map();
 const editedMessageMap = new Map();
 const manualDeletes = new Set();
+const deleteable: string[] = [];
 const cleanups: Array<() => void> = [];
 
 function rawFind(predicate: (m: any) => boolean) {
@@ -37,12 +38,10 @@ function isNativeUpdateRows(m: any) {
 
 const ChannelStore = (findByProps && findByProps("getChannel", "getDMFromUserId")) || (findByStoreName && findByStoreName("ChannelStore"));
 const ChannelMessages = (findByProps && findByProps("_channelMessages")) || rawFind(m => m && m._channelMessages !== undefined);
-const MessageStore = (findByProps && findByProps("getMessage", "getMessages")) || (findByStoreName && findByStoreName("MessageStore"));
+const MessageStore = (findByStoreName && findByStoreName("MessageStore")) || (findByProps && findByProps("getMessage", "getMessages"));
 const UserStore = (findByStoreName && findByStoreName("UserStore")) || (findByProps && findByProps("getCurrentUser"));
 const AuthStore = (findByStoreName && findByStoreName("AuthenticationStore")) || (findByProps && findByProps("getToken"));
 const MessageActions = (findByProps && findByProps("deleteMessage", "startEditMessage")) || (findByProps && findByProps("deleteMessage"));
-const MessageRecordUtils = (findByProps && findByProps("updateMessageRecord", "createMessageRecord")) || rawFind(m => typeof m?.updateMessageRecord === "function");
-const MessageRecord = (findByName && findByName("MessageRecord", false)) || (findByProps && findByProps("MessageRecord") && findByProps("MessageRecord").MessageRecord);
 
 function getCurrentUserId() {
   return (UserStore && UserStore.getCurrentUser && UserStore.getCurrentUser().id) ||
@@ -60,21 +59,36 @@ function trimMap(map: Map<any, any>) {
 function getOriginalMessage(channelId: string, messageId: string) {
   if (!messageId) return undefined;
 
-  // 1. ChannelMessages store
+  if (MessageStore) {
+    try {
+      if (typeof MessageStore.getMessage === "function") {
+        const m = MessageStore.getMessage(channelId, messageId);
+        if (m) return m;
+      }
+      if (typeof MessageStore.getMessages === "function") {
+        const msgs = MessageStore.getMessages(channelId);
+        if (msgs && typeof msgs.get === "function") {
+          const m2 = msgs.get(messageId);
+          if (m2) return m2;
+        }
+      }
+    } catch (e) {}
+  }
+
   if (ChannelMessages) {
     try {
       if (typeof ChannelMessages.get === "function") {
         const ch = ChannelMessages.get(channelId);
         if (ch && typeof ch.get === "function") {
-          const m = ch.get(messageId);
-          if (m) return m;
+          const m3 = ch.get(messageId);
+          if (m3) return m3;
         }
       }
       if (ChannelMessages._channelMessages && ChannelMessages._channelMessages[channelId]) {
         const chObj = ChannelMessages._channelMessages[channelId];
         if (typeof chObj.get === "function") {
-          const m2 = chObj.get(messageId);
-          if (m2) return m2;
+          const m4 = chObj.get(messageId);
+          if (m4) return m4;
         }
         if (chObj._map && chObj._map[messageId]) return chObj._map[messageId];
         if (Array.isArray(chObj._array)) {
@@ -86,28 +100,6 @@ function getOriginalMessage(channelId: string, messageId: string) {
     } catch (e) {}
   }
 
-  // 2. MessageStore
-  if (MessageStore) {
-    try {
-      if (typeof MessageStore.getMessage === "function") {
-        const m3 = MessageStore.getMessage(channelId, messageId);
-        if (m3) return m3;
-      }
-      if (typeof MessageStore.getMessages === "function") {
-        const msgs = MessageStore.getMessages(channelId);
-        if (msgs && typeof msgs.get === "function") {
-          const m4 = msgs.get(messageId);
-          if (m4) return m4;
-        }
-      }
-    } catch (e) {}
-  }
-
-  // 3. Cache
-  if (deletedMessageMap.has(messageId)) {
-    const cached = deletedMessageMap.get(messageId);
-    if (cached && cached.original) return cached.original;
-  }
   if (editedMessageMap.has(messageId)) {
     const cachedEdit = editedMessageMap.get(messageId);
     if (cachedEdit && cachedEdit.original) return cachedEdit.original;
@@ -197,7 +189,7 @@ function handleRow(row: any, opts: any) {
   const msg = row.message;
   if (!msg || !msg.id) return;
 
-  const isDeleted = deletedMessageMap.has(msg.id) || Boolean(msg.was_deleted);
+  const isDeleted = deletedMessageMap.has(msg.id);
   const isEdited = editedMessageMap.has(msg.id);
 
   if (!isDeleted && !isEdited) return;
@@ -205,17 +197,32 @@ function handleRow(row: any, opts: any) {
   if (isDeleted) {
     msg.edited = "(deleted)";
     if (opts.colorHighlights !== false) {
-      msg.textColor = ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747";
-      row.backgroundHighlight = {
-        backgroundColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#f047471f") : "#f047471f",
-        gutterColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#f04747") : "#f04747"
-      };
+      if (ReactNative && ReactNative.processColor) {
+        msg.textColor = ReactNative.processColor("#f04747");
+        row.backgroundHighlight = {
+          backgroundColor: ReactNative.processColor("#f047471f"),
+          gutterColor: ReactNative.processColor("#f04747")
+        };
+      } else {
+        msg.textColor = "#f04747";
+        row.backgroundHighlight = {
+          backgroundColor: "#f047471f",
+          gutterColor: "#f04747"
+        };
+      }
     }
   } else if (isEdited && opts.colorHighlights !== false) {
-    row.backgroundHighlight = {
-      backgroundColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a18") : "#faa61a18",
-      gutterColor: ReactNative && ReactNative.processColor ? ReactNative.processColor("#faa61a") : "#faa61a"
-    };
+    if (ReactNative && ReactNative.processColor) {
+      row.backgroundHighlight = {
+        backgroundColor: ReactNative.processColor("#faa61a18"),
+        gutterColor: ReactNative.processColor("#faa61a")
+      };
+    } else {
+      row.backgroundHighlight = {
+        backgroundColor: "#faa61a18",
+        gutterColor: "#faa61a"
+      };
+    }
   }
 }
 
@@ -302,6 +309,7 @@ function Settings() {
           const count = deletedMessageMap.size;
           deletedMessageMap.clear();
           editedMessageMap.clear();
+          deleteable.length = 0;
           forceUpdate();
           if (toasts && toasts.showToast) {
             toasts.showToast("Cleared " + count + " logged messages from Lucid cache!");
@@ -353,46 +361,7 @@ export default {
       cleanups.push(unpatchStartEdit);
     }
 
-    // 3. PRESERVE was_deleted IN MESSAGERECORDUTILS
-    if (MessageRecordUtils) {
-      if (after && MessageRecordUtils.createMessageRecord) {
-        cleanups.push(
-          after("createMessageRecord", MessageRecordUtils, (args: any, record: any) => {
-            const msg = args && args[0];
-            if (msg && msg.was_deleted && record) {
-              record.was_deleted = true;
-            }
-          })
-        );
-      }
-
-      if (instead && MessageRecordUtils.updateMessageRecord) {
-        cleanups.push(
-          instead("updateMessageRecord", MessageRecordUtils, function (args: any, origFunc: any) {
-            const oldRec = args && args[0];
-            const newRec = args && args[1];
-            if (newRec && newRec.was_deleted) {
-              const reactions = oldRec ? oldRec.reactions : undefined;
-              return MessageRecordUtils.createMessageRecord(newRec, reactions);
-            }
-            return origFunc.apply(this, args);
-          })
-        );
-      }
-    }
-
-    if (after && MessageRecord && typeof MessageRecord.default === "function") {
-      cleanups.push(
-        after("default", MessageRecord, (args: any, record: any) => {
-          const props = args && args[0];
-          if (props && props.was_deleted && record) {
-            record.was_deleted = true;
-          }
-        })
-      );
-    }
-
-    // 4. FLUX DISPATCHER HOOK (DELETE & EDIT REWRITING ENGINE)
+    // 3. FLUX DISPATCHER HOOK (BULLETPROOF AUTOMOD REWRITE ENGINE)
     if (!before || !FluxDispatcher) {
       console.warn(TAG, "FluxDispatcher not found!");
       return;
@@ -406,13 +375,13 @@ export default {
         const currentUserId = getCurrentUserId();
 
         /* =========================================================
-            MESSAGE_DELETE (Dual-stage rewrite engine)
+            MESSAGE_DELETE (AutoMod Edit Failed Engine)
         ==========================================================*/
         if (ev.type === "MESSAGE_DELETE" && opts.logDeleted) {
           const msgId = ev.id || ev.messageId || (ev.message && ev.message.id);
           const chId = ev.channelId || ev.channel_id || (ev.message && (ev.message.channel_id || ev.message.channelId));
 
-          if (!msgId) return args;
+          if (!msgId || !chId) return args;
 
           if (manualDeletes.has(msgId)) {
             manualDeletes.delete(msgId);
@@ -420,72 +389,40 @@ export default {
             return args;
           }
 
-          const existing = deletedMessageMap.get(msgId);
-          if (existing) {
-            if (existing.stage === 2) {
-              return args;
-            }
-            if (existing.stage === 1) {
-              existing.stage = 2;
-              return existing.message || args;
-            }
+          if (deleteable.indexOf(msgId) !== -1) {
+            deleteable.splice(deleteable.indexOf(msgId), 1);
+            deletedMessageMap.delete(msgId);
+            return args;
           }
+          deleteable.push(msgId);
+          if (deleteable.length > 500) deleteable.shift();
 
-          const orig = getOriginalMessage(chId, msgId);
-          if (!orig) return args;
+          const message = getOriginalMessage(chId, msgId);
+          const authorId = message && message.author && message.author.id;
 
-          const authorId = (orig.author && orig.author.id) || (orig.author && orig.author.userId);
-          const authorUsername = orig.author && (orig.author.username || orig.author.globalName || orig.author.global_name);
-          if (!authorId || !authorUsername) return args;
-
-          if (orig.author.bot && (orig.flags === 64 || (orig.flags & 64) === 64)) return args;
-          if (opts.ignoreBots && orig.author.bot) return args;
+          if (opts.ignoreBots && message && message.author && message.author.bot) return args;
           if (opts.ignoreSelf && authorId === currentUserId) return args;
 
-          const hasContent = typeof orig.content === "string" && orig.content.length > 0;
-          const hasAttachments = Array.isArray(orig.attachments) && orig.attachments.length > 0;
-          const hasEmbeds = Array.isArray(orig.embeds) && orig.embeds.length > 0;
-          const hasStickers = Array.isArray(orig.sticker_items || orig.stickers) && (orig.sticker_items || orig.stickers).length > 0;
-
-          if (!hasContent && !hasAttachments && !hasEmbeds && !hasStickers) return args;
-
-          const targetChannelId = orig.channel_id || orig.channelId || chId;
-          const guildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(targetChannelId) && ChannelStore.getChannel(targetChannelId).guild_id) || orig.guild_id || orig.guildId;
-
-          const gatewayOrig = recordToGateway(orig);
-
-          const updatePayload = Object.assign({}, gatewayOrig, {
-            id: msgId,
-            content: orig.content || "",
-            channel_id: targetChannelId,
-            guild_id: guildId,
-            type: orig.type !== undefined ? orig.type : 0,
-            flags: 64,
-            state: "SENT",
-            timestamp: orig.timestamp || new Date().toISOString(),
-            was_deleted: true,
-            attachments: Array.isArray(orig.attachments) ? orig.attachments : [],
-            embeds: Array.isArray(orig.embeds) ? orig.embeds.map(embedToGateway) : [],
-            sticker_items: orig.sticker_items || orig.stickers || [],
-            message_reference: orig.message_reference || orig.messageReference || null
-          });
-
-          args[0] = {
-            type: "MESSAGE_UPDATE",
-            channelId: targetChannelId,
-            message: updatePayload,
-            optimistic: false,
-            sendMessageOptions: {},
-            isPushNotification: false
-          };
-
           deletedMessageMap.set(msgId, {
-            message: args,
-            original: orig,
-            stage: 1
+            channelId: chId,
+            timestamp: Date.now()
           });
           trimMap(deletedMessageMap);
 
+          args[0] = {
+            type: "MESSAGE_EDIT_FAILED_AUTOMOD",
+            messageData: {
+              type: 1,
+              message: {
+                channelId: chId,
+                messageId: msgId,
+              },
+            },
+            errorResponseBody: {
+              code: 200000,
+              message: "(deleted)",
+            },
+          };
           return args;
         }
 
@@ -503,34 +440,22 @@ export default {
               continue;
             }
 
-            const origBulk = getOriginalMessage(bulkChannelId, bId);
-            if (!origBulk || !origBulk.author || !origBulk.author.id) continue;
-            if (opts.ignoreBots && origBulk.author.bot) continue;
-            if (opts.ignoreSelf && origBulk.author.id === currentUserId) continue;
-
-            const bGuildId = (ChannelStore && ChannelStore.getChannel && ChannelStore.getChannel(bulkChannelId) && ChannelStore.getChannel(bulkChannelId).guild_id) || origBulk.guild_id;
-            const gatewayBulk = recordToGateway(origBulk);
-
-            deletedMessageMap.set(bId, {
-              original: origBulk,
-              stage: 2
-            });
+            deletedMessageMap.set(bId, { channelId: bulkChannelId, timestamp: Date.now() });
             trimMap(deletedMessageMap);
 
             FluxDispatcher.dispatch({
-              type: "MESSAGE_UPDATE",
-              channelId: bulkChannelId,
-              message: Object.assign({}, gatewayBulk, {
-                id: bId,
-                content: origBulk.content || "",
-                channel_id: bulkChannelId,
-                guild_id: bGuildId,
-                type: origBulk.type !== undefined ? origBulk.type : 0,
-                flags: 64,
-                state: "SENT",
-                timestamp: origBulk.timestamp || new Date().toISOString(),
-                was_deleted: true
-              }),
+              type: "MESSAGE_EDIT_FAILED_AUTOMOD",
+              messageData: {
+                type: 1,
+                message: {
+                  channelId: bulkChannelId,
+                  messageId: bId,
+                },
+              },
+              errorResponseBody: {
+                code: 200000,
+                message: "(deleted)",
+              },
               otherPluginBypass: true
             });
           }
@@ -543,7 +468,7 @@ export default {
         if (ev.type === "MESSAGE_UPDATE" && opts.logEdited) {
           const msg = ev.message;
           if (!msg) return args;
-          if (msg.was_deleted) return args;
+          if (deletedMessageMap.has(msg.id || ev.id)) return args;
 
           if (!msg.edited_timestamp || msg.edited_timestamp === "invalid_timestamp") return args;
 
@@ -595,7 +520,7 @@ export default {
     });
     cleanups.push(unpatchFlux);
 
-    // 5. ROW STYLING (Vencord PC Red / Yellow Backgrounds)
+    // 4. ROW STYLING (Vencord PC Red / Yellow Backgrounds)
     const DCDChatManager = ReactNative && ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager;
     const applyHook = (target: any) => {
       if (!target || typeof target.updateRows !== "function") return;
@@ -612,7 +537,7 @@ export default {
               for (let i = 0; i < rows.length; i++) {
                 const row = rows[i];
                 if (row && row.type === 1 && row.message) {
-                  if (deletedMessageMap.has(row.message.id) || row.message.was_deleted || editedMessageMap.has(row.message.id)) {
+                  if (deletedMessageMap.has(row.message.id) || editedMessageMap.has(row.message.id)) {
                     handleRow(row, opts);
                     mutated = true;
                   }
@@ -665,6 +590,7 @@ export default {
     deletedMessageMap.clear();
     editedMessageMap.clear();
     manualDeletes.clear();
+    deleteable.length = 0;
   },
 
   settings: Settings
